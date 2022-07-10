@@ -933,6 +933,106 @@ void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
 
 #endif // defined(DEBUG_THREAD) || defined(DEBUG_FULL)
 
+
+#if defined(USE_PTHREAD_EMULATION)
+
+/* pthread rwlock emulation using plocks (to avoid expensive futexes).
+ * these are a direct mapping on Progressive Locks, with the exception that
+ * since there's a common unlock operation in pthreads, we need to know if
+ * we need to unlock for reads or writes, so we set the topmost bit to 1 when
+ * a write lock is acquired to indicate that a write unlock needs to be
+ * performed. It's not a problem since this bit will never be used given that
+ * haproxy won't support as many threads as the plocks.
+ *
+ * The storage is the pthread_rwlock_t cast as an ulong
+ */
+
+int pthread_rwlock_init(pthread_rwlock_t *restrict rwlock, const pthread_rwlockattr_t *restrict attr)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	*lock = 0;
+	return 0;
+}
+
+int pthread_rwlock_destroy(pthread_rwlock_t *rwlock)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	*lock = 0;
+	return 0;
+}
+
+int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	pl_take_r(lock);
+	return 0;
+}
+
+int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	return !pl_try_r(lock);
+}
+
+int pthread_rwlock_timedrdlock(pthread_rwlock_t *restrict rwlock, const struct timespec *restrict abstime)
+{
+	return pthread_rwlock_tryrdlock(rwlock);
+}
+
+int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	pl_take_w(lock);
+	/* remember in the topmost bit that the WR lock is held */
+	pl_or(lock, (1UL << (sizeof(*lock) * 8 - 1)));
+	return 0;
+}
+
+int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	if (pl_try_w(lock)) {
+		/* remember in the topmost bit that the WR lock is held */
+		pl_or(lock, (1UL << (sizeof(*lock) * 8 - 1)));
+		return 0;
+	}
+	return 1;
+}
+
+int pthread_rwlock_timedwrlock(pthread_rwlock_t *restrict rwlock, const struct timespec *restrict abstime)
+{
+	return pthread_rwlock_trywrlock(rwlock);
+}
+
+int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	/* the below could also be done using a btr, though it costs a write */
+	if (*lock & (1UL << (sizeof(*lock) * 8 - 1))) {
+		/* last one was a write lock. Note that the two operations
+		 * below can be summed up into a single pl_sub().
+		 */
+		//pl_sub(lock, (1UL << (sizeof(*lock) * 8 - 1)));
+		//pl_drop_w(lock);
+		if (sizeof(*lock) == 8)
+			pl_sub(lock, (1UL << 63) | PLOCK64_WL_1 | PLOCK64_SL_1 | PLOCK64_RL_1);
+		else
+			pl_sub(lock, (1UL << 31) | PLOCK32_WL_1 | PLOCK32_SL_1 | PLOCK32_RL_1);
+	} else {
+		/* that was a read lock */
+		pl_drop_r(lock);
+	}
+	return 0;
+}
+#endif // defined(USE_PTHREAD_EMULATION)
+
 /* Depending on the platform and how libpthread was built, pthread_exit() may
  * involve some code in libgcc_s that would be loaded on exit for the first
  * time, causing aborts if the process is chrooted. It's harmless bit very
